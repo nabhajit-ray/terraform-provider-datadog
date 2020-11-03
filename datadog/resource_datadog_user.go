@@ -1,13 +1,23 @@
 package datadog
 
 import (
+	"fmt"
 	"log"
+	"regexp"
+	"strings"
+
 	//"strings"
 
 	datadogV2 "github.com/DataDog/datadog-api-client-go/api/v2/datadog"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
 	"github.com/zorkian/go-datadog-api"
 )
+
+var uuidRegex = regexp.MustCompile("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+func isV1User(id string) bool {
+	return uuidRegex.MatchString(id)
+}
 
 func resourceDatadogUser() *schema.Resource {
 	return &schema.Resource{
@@ -46,10 +56,11 @@ func resourceDatadogUser() *schema.Resource {
 				Deprecated: "This parameter will be replaced by `access_role` and will be removed from the next Major version",
 			},
 			"access_role": {
-				Type:     schema.TypeString,
-				Optional: true,
-				Required: false,
-				Default:  "st",
+				Type:       schema.TypeString,
+				Optional:   true,
+				Required:   false,
+				Default:    "st",
+				Deprecated: "This parameter is replaced by `roles` and will be removed from the next major version",
 			},
 			"name": {
 				Type:     schema.TypeString,
@@ -59,6 +70,10 @@ func resourceDatadogUser() *schema.Resource {
 				Type:       schema.TypeString,
 				Optional:   true,
 				Deprecated: "This parameter was removed from the API and has no effect",
+			},
+			"roles": {
+				Type:     schema.TypeList,
+				Optional: true,
 			},
 			"verified": {
 				Type:     schema.TypeBool,
@@ -72,17 +87,8 @@ func resourceDatadogUserExists(d *schema.ResourceData, meta interface{}) (b bool
 	// Exists - This is called to verify a resource still exists. It is called prior to Read,
 	// and lowers the burden of Read to be able to assume the resource exists.
 	providerConf := meta.(*ProviderConfiguration)
-	datadogClientV2 := providerConf.DatadogClientV2
-	authV2 := providerConf.AuthV2
 
-	if _, httpResponse, err := datadogClientV2.UsersApi.GetUser(authV2, d.Id()).Execute(); err != nil {
-		if httpResponse != nil && httpResponse.StatusCode == 404 {
-			return false, nil
-		}
-		return false, translateClientError(err, "error getting user")
-	}
-
-	/*
+	if isV1User(d.Id()) {
 		client := providerConf.CommunityClient
 
 		if _, err := client.GetUser(d.Id()); err != nil {
@@ -91,12 +97,22 @@ func resourceDatadogUserExists(d *schema.ResourceData, meta interface{}) (b bool
 			}
 			return false, translateClientError(err, "error checking user exists")
 		}
-	*/
+	} else {
+		datadogClientV2 := providerConf.DatadogClientV2
+		authV2 := providerConf.AuthV2
+
+		if _, httpResponse, err := datadogClientV2.UsersApi.GetUser(authV2, d.Id()).Execute(); err != nil {
+			if httpResponse != nil && httpResponse.StatusCode == 404 {
+				return false, nil
+			}
+			return false, translateClientError(err, "error checking user exists")
+		}
+	}
 
 	return true, nil
 }
 
-func buildDatadogUserStruct(d *schema.ResourceData) *datadog.User {
+func buildDatadogUserV1Struct(d *schema.ResourceData) *datadog.User {
 	var u datadog.User
 	u.SetDisabled(d.Get("disabled").(bool))
 	u.SetEmail(d.Get("email").(string))
@@ -121,7 +137,7 @@ func buildDatadogUserV2UpdateStruct(d *schema.ResourceData) *datadogV2.UserUpdat
 	user := datadogV2.NewUserUpdateAttributesWithDefaults()
 	user.SetEmail(d.Get("email").(string))
 	user.SetName(d.Get("name").(string))
-	//user.SetTitle(d.Get("title").(string))
+	user.SetDisabled(d.Get("disabled").(bool))
 
 	return user
 }
@@ -145,12 +161,31 @@ func resourceDatadogUserCreate(d *schema.ResourceData, meta interface{}) error {
 			return translateClientError(err, "error creating user")
 		}
 		log.Printf("[INFO] Updating existing Datadog user %s", uca.Email)
-	}
+		// Find user ID by listing user and filtering by emai
+		ulr, _, err := datadogClientV2.UsersApi.ListUsers(authV2).Filter(uca.Email).Execute()
+		if err != nil {
+			return translateClientError(err, "error searching user")
+		}
+		if len(ulr.GetData()) != 1 {
+			return fmt.Errorf("could not find single user with email %s", uca.Email)
+		}
+		userID := ulr.GetData()[0].GetId()
+		uua := buildDatadogUserV2UpdateStruct(d)
+		uud := datadogV2.NewUserUpdateDataWithDefaults()
+		uud.SetAttributes(*uua)
+		uud.SetId(userID)
+		uur := datadogV2.NewUserUpdateRequestWithDefaults()
+		uur.SetData(*uud)
 
-	/*
-		if err := client.UpdateUser(*u); err != nil {
+		res, _, err := datadogClientV2.UsersApi.UpdateUser(authV2, userID).Body(*uur).Execute()
+		if err != nil {
 			return translateClientError(err, "error updating user")
-		}*/
+		}
+		urData := res.GetData()
+		d.SetId(urData.GetId())
+
+		return resourceDatadogUserRead(d, meta)
+	}
 
 	urData := ur.GetData()
 	d.SetId(urData.GetId())
